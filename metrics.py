@@ -4,8 +4,8 @@ import statistics
 import argparse
 from typing import Tuple, Optional
 
-import standard_aes as std
-import aes as mod
+import std_aes as std
+import mod_aes as mod
 
 
 def randbytes(n: int) -> bytes:

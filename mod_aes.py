@@ -185,6 +185,10 @@ class AES:
         assert len(master_key) in AES.rounds_by_key_size
         self.n_rounds = AES.rounds_by_key_size[len(master_key)]
         self._key_matrices = self._expand_key(master_key)
+        # KDRP: derive per-key row-shift permutation from first 4 key bytes
+        self.perm = self._generate_kdrp_permutation(master_key)
+        # KW-Tweak: keep master key for whitening PRF
+        self._master_key = bytes(master_key)
 
     def _expand_key(self, master_key):
         """
@@ -220,49 +224,114 @@ class AES:
         # Group key words in 4x4 byte matrices.
         return [key_columns[4*i : 4*(i+1)] for i in range(len(key_columns) // 4)]
 
-    def encrypt_block(self, plaintext):
+    # --- KDRP helpers ---
+    def _generate_kdrp_permutation(self, master_key: bytes):
         """
-        Encrypts a single block of 16 byte long plaintext.
+        Derive a permutation of [0,1,2,3] from the first 4 bytes of the master key.
+        This permutation provides the left-rotation amount per row.
+        """
+        vals = list(master_key[:4])
+        # Stable sort indices by their values -> deterministic permutation
+        perm = sorted(range(4), key=lambda x: vals[x])
+        return perm
+
+    def _shift_rows_kdrp(self, s):
+        """
+        Apply key-derived dynamic row permutation: rotate row r left by perm[r].
+        State s is 4 columns of 4 bytes (column-major).
+        """
+        for r in range(4):
+            k = self.perm[r] & 3
+            if k:
+                row = [s[c][r] for c in range(4)]
+                rotated = row[k:] + row[:k]
+                for c, v in enumerate(rotated):
+                    s[c][r] = v
+
+    def _inv_shift_rows_kdrp(self, s):
+        """
+        Inverse of KDRP: rotate row r right by perm[r].
+        """
+        for r in range(4):
+            k = self.perm[r] & 3
+            if k:
+                row = [s[c][r] for c in range(4)]
+                rotated = row[-k:] + row[:-k]
+                for c, v in enumerate(rotated):
+                    s[c][r] = v
+    # --- end KDRP helpers ---
+
+    # --- KW-Tweak helpers ---
+    def _kw_tweak_bytes(self, block_index: int, iv: bytes | None) -> bytes:
+        """
+        Compose tweak bytes as (iv || block_index[8]) if iv is provided,
+        otherwise just block_index[8].
+        """
+        bi = int(block_index).to_bytes(8, 'big')
+        return (iv or b'') + bi
+
+    def _kw_whitening_mask(self, tweak_bytes: bytes) -> bytes:
+        """
+        Whitening mask W = Trunc16(SHA256(tweak || master_key))
+        """
+        import hashlib
+        return hashlib.sha256(tweak_bytes + self._master_key).digest()[:16]
+    # --- end KW-Tweak helpers ---
+
+    def encrypt_block(self, plaintext, block_index: int = 0, tweak_iv: bytes | None = None):
+        """
+        Encrypts a single block of 16 byte long plaintext with KW-Tweak whitening and KDRP.
+        Whitening is applied to the input of the AES round-function.
         """
         assert len(plaintext) == 16
 
-        plain_state = bytes2matrix(plaintext)
+        # KW-Tweak pre-whitening
+        mask = self._kw_whitening_mask(self._kw_tweak_bytes(block_index, tweak_iv))
+        xored = xor_bytes(plaintext, mask)
+
+        plain_state = bytes2matrix(xored)
 
         add_round_key(plain_state, self._key_matrices[0])
 
         for i in range(1, self.n_rounds):
             sub_bytes(plain_state)
-            shift_rows(plain_state)
+            self._shift_rows_kdrp(plain_state)
             mix_columns(plain_state)
             add_round_key(plain_state, self._key_matrices[i])
 
         sub_bytes(plain_state)
-        shift_rows(plain_state)
+        self._shift_rows_kdrp(plain_state)
         add_round_key(plain_state, self._key_matrices[-1])
 
         return matrix2bytes(plain_state)
 
-    def decrypt_block(self, ciphertext):
+    def decrypt_block(self, ciphertext, block_index: int = 0, tweak_iv: bytes | None = None):
         """
-        Decrypts a single block of 16 byte long ciphertext.
+        Decrypts a single block of 16 byte long ciphertext for KW-Tweak + KDRP AES.
+        Whitening is removed after the AES inverse rounds.
         """
         assert len(ciphertext) == 16
+
+        # Pre-compute whitening mask (same tweak as encryption)
+        mask = self._kw_whitening_mask(self._kw_tweak_bytes(block_index, tweak_iv))
 
         cipher_state = bytes2matrix(ciphertext)
 
         add_round_key(cipher_state, self._key_matrices[-1])
-        inv_shift_rows(cipher_state)
+        self._inv_shift_rows_kdrp(cipher_state)
         inv_sub_bytes(cipher_state)
 
         for i in range(self.n_rounds - 1, 0, -1):
             add_round_key(cipher_state, self._key_matrices[i])
             inv_mix_columns(cipher_state)
-            inv_shift_rows(cipher_state)
+            self._inv_shift_rows_kdrp(cipher_state)
             inv_sub_bytes(cipher_state)
 
         add_round_key(cipher_state, self._key_matrices[0])
 
-        return matrix2bytes(cipher_state)
+        # Remove whitening
+        pre_chain = matrix2bytes(cipher_state)
+        return xor_bytes(pre_chain, mask)
 
     def encrypt_cbc(self, plaintext, iv):
         """
@@ -275,9 +344,10 @@ class AES:
 
         blocks = []
         previous = iv
-        for plaintext_block in split_blocks(plaintext):
-            # CBC mode encrypt: encrypt(plaintext_block XOR previous)
-            block = self.encrypt_block(xor_bytes(plaintext_block, previous))
+        for idx, plaintext_block in enumerate(split_blocks(plaintext)):
+            # CBC chaining then KW-Tweak whitening inside encrypt_block
+            x = xor_bytes(plaintext_block, previous)
+            block = self.encrypt_block(x, block_index=idx, tweak_iv=iv)
             blocks.append(block)
             previous = block
 
@@ -292,9 +362,10 @@ class AES:
 
         blocks = []
         previous = iv
-        for ciphertext_block in split_blocks(ciphertext):
-            # CBC mode decrypt: previous XOR decrypt(ciphertext)
-            blocks.append(xor_bytes(previous, self.decrypt_block(ciphertext_block)))
+        for idx, ciphertext_block in enumerate(split_blocks(ciphertext)):
+            # KW-Tweak removed inside decrypt_block, then CBC unchaining
+            x = self.decrypt_block(ciphertext_block, block_index=idx, tweak_iv=iv)
+            blocks.append(xor_bytes(previous, x))
             previous = ciphertext_block
 
         return unpad(b''.join(blocks))
@@ -311,9 +382,9 @@ class AES:
         blocks = []
         prev_ciphertext = iv
         prev_plaintext = bytes(16)
-        for plaintext_block in split_blocks(plaintext):
-            # PCBC mode encrypt: encrypt(plaintext_block XOR (prev_ciphertext XOR prev_plaintext))
-            ciphertext_block = self.encrypt_block(xor_bytes(plaintext_block, xor_bytes(prev_ciphertext, prev_plaintext)))
+        for idx, plaintext_block in enumerate(split_blocks(plaintext)):
+            x = xor_bytes(plaintext_block, xor_bytes(prev_ciphertext, prev_plaintext))
+            ciphertext_block = self.encrypt_block(x, block_index=idx, tweak_iv=iv)
             blocks.append(ciphertext_block)
             prev_ciphertext = ciphertext_block
             prev_plaintext = plaintext_block
@@ -330,9 +401,9 @@ class AES:
         blocks = []
         prev_ciphertext = iv
         prev_plaintext = bytes(16)
-        for ciphertext_block in split_blocks(ciphertext):
-            # PCBC mode decrypt: (prev_plaintext XOR prev_ciphertext) XOR decrypt(ciphertext_block)
-            plaintext_block = xor_bytes(xor_bytes(prev_ciphertext, prev_plaintext), self.decrypt_block(ciphertext_block))
+        for idx, ciphertext_block in enumerate(split_blocks(ciphertext)):
+            x = self.decrypt_block(ciphertext_block, block_index=idx, tweak_iv=iv)
+            plaintext_block = xor_bytes(xor_bytes(prev_ciphertext, prev_plaintext), x)
             blocks.append(plaintext_block)
             prev_ciphertext = ciphertext_block
             prev_plaintext = plaintext_block
@@ -347,9 +418,10 @@ class AES:
 
         blocks = []
         prev_ciphertext = iv
-        for plaintext_block in split_blocks(plaintext, require_padding=False):
-            # CFB mode encrypt: plaintext_block XOR encrypt(prev_ciphertext)
-            ciphertext_block = xor_bytes(plaintext_block, self.encrypt_block(prev_ciphertext))
+        for idx, plaintext_block in enumerate(split_blocks(plaintext, require_padding=False)):
+            # Keystream generated via AES(prev) with KW-Tweak
+            keystream = self.encrypt_block(prev_ciphertext, block_index=idx, tweak_iv=iv)
+            ciphertext_block = xor_bytes(plaintext_block, keystream)
             blocks.append(ciphertext_block)
             prev_ciphertext = ciphertext_block
 
@@ -363,9 +435,9 @@ class AES:
 
         blocks = []
         prev_ciphertext = iv
-        for ciphertext_block in split_blocks(ciphertext, require_padding=False):
-            # CFB mode decrypt: ciphertext XOR decrypt(prev_ciphertext)
-            plaintext_block = xor_bytes(ciphertext_block, self.encrypt_block(prev_ciphertext))
+        for idx, ciphertext_block in enumerate(split_blocks(ciphertext, require_padding=False)):
+            keystream = self.encrypt_block(prev_ciphertext, block_index=idx, tweak_iv=iv)
+            plaintext_block = xor_bytes(ciphertext_block, keystream)
             blocks.append(plaintext_block)
             prev_ciphertext = ciphertext_block
 
@@ -379,12 +451,11 @@ class AES:
 
         blocks = []
         previous = iv
-        for plaintext_block in split_blocks(plaintext, require_padding=False):
-            # OFB mode encrypt: plaintext_block XOR encrypt(previous)
-            block = self.encrypt_block(previous)
-            ciphertext_block = xor_bytes(plaintext_block, block)
+        for idx, plaintext_block in enumerate(split_blocks(plaintext, require_padding=False)):
+            keystream = self.encrypt_block(previous, block_index=idx, tweak_iv=iv)
+            ciphertext_block = xor_bytes(plaintext_block, keystream)
             blocks.append(ciphertext_block)
-            previous = block
+            previous = keystream
 
         return b''.join(blocks)
 
@@ -396,12 +467,11 @@ class AES:
 
         blocks = []
         previous = iv
-        for ciphertext_block in split_blocks(ciphertext, require_padding=False):
-            # OFB mode decrypt: ciphertext XOR encrypt(previous)
-            block = self.encrypt_block(previous)
-            plaintext_block = xor_bytes(ciphertext_block, block)
+        for idx, ciphertext_block in enumerate(split_blocks(ciphertext, require_padding=False)):
+            keystream = self.encrypt_block(previous, block_index=idx, tweak_iv=iv)
+            plaintext_block = xor_bytes(ciphertext_block, keystream)
             blocks.append(plaintext_block)
-            previous = block
+            previous = keystream
 
         return b''.join(blocks)
 
@@ -413,9 +483,9 @@ class AES:
 
         blocks = []
         nonce = iv
-        for plaintext_block in split_blocks(plaintext, require_padding=False):
-            # CTR mode encrypt: plaintext_block XOR encrypt(nonce)
-            block = xor_bytes(plaintext_block, self.encrypt_block(nonce))
+        for idx, plaintext_block in enumerate(split_blocks(plaintext, require_padding=False)):
+            keystream = self.encrypt_block(nonce, block_index=idx, tweak_iv=iv)
+            block = xor_bytes(plaintext_block, keystream)
             blocks.append(block)
             nonce = inc_bytes(nonce)
 
@@ -429,9 +499,9 @@ class AES:
 
         blocks = []
         nonce = iv
-        for ciphertext_block in split_blocks(ciphertext, require_padding=False):
-            # CTR mode decrypt: ciphertext XOR encrypt(nonce)
-            block = xor_bytes(ciphertext_block, self.encrypt_block(nonce))
+        for idx, ciphertext_block in enumerate(split_blocks(ciphertext, require_padding=False)):
+            keystream = self.encrypt_block(nonce, block_index=idx, tweak_iv=iv)
+            block = xor_bytes(ciphertext_block, keystream)
             blocks.append(block)
             nonce = inc_bytes(nonce)
 
@@ -450,13 +520,15 @@ class AES:
 
         for i in range(1, self.n_rounds):
             sub_bytes(s)
-            shift_rows(s)
+            # shift_rows(s)
+            self._shift_rows_kdrp(s)
             mix_columns(s)
             add_round_key(s, self._key_matrices[i])
             rounds.append(matrix2bytes([row[:] for row in s]))
 
         sub_bytes(s)
-        shift_rows(s)
+        # shift_rows(s)
+        self._shift_rows_kdrp(s)
         add_round_key(s, self._key_matrices[-1])
         rounds.append(matrix2bytes([row[:] for row in s]))
 
@@ -552,7 +624,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print('Usage: ./aes.py encrypt "key" "message"')
         print('Running tests...')
-        from standard_tests import run
+        from mod_tests import run
         run()
     elif len(sys.argv) == 2 and sys.argv[1] == 'benchmark':
         benchmark()
