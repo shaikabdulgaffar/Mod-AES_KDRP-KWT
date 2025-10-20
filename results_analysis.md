@@ -1,7 +1,4 @@
-# KW‑Tweak + KDRP: A Tweakable, Key‑Dependent AES Variant with Hash‑Based Whitening and Dynamic Row Rotation
-
-
-# Results Aanalysis
+# KW‑Tweak + KDRP: A Tweakable, Key‑Dependent AES Variant with Hash‑Based Whitening and Dynamic Row Rotation Results Aanalysis
 
 # 1. Avalanche Effect Results & Analysis
 
@@ -293,6 +290,13 @@ You evaluated key sensitivity for Standard AES and Modified AES (with KDRP + KW-
 
 # 5. Differential Resistance Results & Analysis
 
+### Syntax to run:
+python differential_resistance.py --key-size 16 --message-bytes 1024 --correctness-trials 10 --trials 100 --diff-mode bit
+
+python differential_resistance.py --key-size 16 --message-bytes 1024 --correctness-trials 10 --trials 100 --diff-mode byte
+
+---
+
 ### **Summary of Experiments**
 
 You evaluated differential resistance for both Standard AES and Modified AES (KDRP + KW-Tweak) using CBC mode, across all key sizes (128, 192, 256 bits), two message sizes (1024 and 10240 bytes), and two differential modes (bit and byte flips in the first block of plaintext).  
@@ -355,6 +359,11 @@ You evaluated differential resistance for both Standard AES and Modified AES (KD
 
 # 6. Ciphertext Entropy Results & Analysis
 
+### Syntax to run:
+python entropy.py --key-size 16 --message-bytes 1024 --correctness-trials 10 --trials 100
+
+---
+
 ### **Summary of Experiments**
 
 You measured the entropy (randomness in bits per byte) of ciphertext outputs from Standard AES and Modified AES (with KDRP + KW-Tweak), using CBC mode with all AES key sizes (128, 192, 256 bits) and two message sizes (1024 and 10240 bytes).  
@@ -404,6 +413,11 @@ You measured the entropy (randomness in bits per byte) of ciphertext outputs fro
 
 # 7. Memory Utilization Results & Analysis
 
+### Syntax to run:
+python memory_utilization.py --key-size 16 --message-bytes 1024 --correctness-trials 10 --trials 100 
+
+---
+
 ### **Summary of Experiments**
 
 You measured the peak Python memory allocations (using tracemalloc) during CBC encryption and decryption operations for both Standard AES and Modified AES (KDRP + KW-Tweak), across all AES key sizes (128, 192, 256 bits) and two message sizes (1024 and 10240 bytes).
@@ -447,5 +461,3 @@ You measured the peak Python memory allocations (using tracemalloc) during CBC e
 
 - **Standard AES is slightly more memory-efficient** than Modified AES, but the difference is minimal.
 - The additional operations in Modified AES (KDRP + KW-Tweak) do not significantly impact memory usage, making it suitable for practical deployment.
-
-If you need this formatted for a specific section or want to combine with other results in your paper, let me know!
